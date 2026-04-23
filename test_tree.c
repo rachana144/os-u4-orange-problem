@@ -1,110 +1,137 @@
-// test_tree.c — Phase 2 test program
+// tree.c — Tree object serialization and construction
 //
-// Compile and run:
-//   make test_tree
-//   ./test_tree
+// PROVIDED functions: get_file_mode, tree_parse, tree_serialize
+// TODO functions:     tree_from_index
+//
+// Binary tree format (per entry, concatenated with no separators):
+//   "<mode-as-ascii-octal> <name>\0<32-byte-binary-hash>"
+//
+// Example single entry (conceptual):
+//   "100644 hello.txt\0" followed by 32 raw bytes of SHA-256
 
-#include "pes.h"
 #include "tree.h"
 #include <stdio.h>
-#include <string.h>
-#include <assert.h>
 #include <stdlib.h>
+#include <string.h>
+#include <dirent.h>
+#include <sys/stat.h>
 
-void test_tree_roundtrip(void) {
-    // Build a tree manually
-    Tree original;
-    original.count = 3;
+// ─── Mode Constants ─────────────────────────────────────────────────────────
 
-    original.entries[0].mode = 0100644;
-    memset(original.entries[0].hash.hash, 0xAA, HASH_SIZE);
-    strcpy(original.entries[0].name, "README.md");
+#define MODE_FILE      0100644
+#define MODE_EXEC      0100755
+#define MODE_DIR       0040000
 
-    original.entries[1].mode = 0040000;
-    memset(original.entries[1].hash.hash, 0xBB, HASH_SIZE);
-    strcpy(original.entries[1].name, "src");
+// ─── PROVIDED ───────────────────────────────────────────────────────────────
 
-    original.entries[2].mode = 0100755;
-    memset(original.entries[2].hash.hash, 0xCC, HASH_SIZE);
-    strcpy(original.entries[2].name, "build.sh");
+// Determine the object mode for a filesystem path.
+uint32_t get_file_mode(const char *path) {
+    struct stat st;
+    if (lstat(path, &st) != 0) return 0;
 
-    // Serialize
-    void *data;
-    size_t len;
-    int rc = tree_serialize(&original, &data, &len);
-    assert(rc == 0);
-    assert(data != NULL);
-    assert(len > 0);
-    printf("Serialized tree: %zu bytes\n", len);
-
-    // Parse back
-    Tree parsed;
-    rc = tree_parse(data, len, &parsed);
-    assert(rc == 0);
-    assert(parsed.count == 3);
-
-    // Verify entries are sorted by name (tree_serialize must sort)
-    assert(strcmp(parsed.entries[0].name, "README.md") == 0);
-    assert(strcmp(parsed.entries[1].name, "build.sh") == 0);
-    assert(strcmp(parsed.entries[2].name, "src") == 0);
-
-    // Verify modes preserved
-    assert(parsed.entries[0].mode == 0100644);
-    assert(parsed.entries[1].mode == 0100755);
-    assert(parsed.entries[2].mode == 0040000);
-
-    // Verify hashes preserved
-    assert(memcmp(parsed.entries[0].hash.hash, original.entries[0].hash.hash, HASH_SIZE) == 0);
-
-    free(data);
-
-    printf("PASS: tree serialize/parse roundtrip\n");
+    if (S_ISDIR(st.st_mode))  return MODE_DIR;
+    if (st.st_mode & S_IXUSR) return MODE_EXEC;
+    return MODE_FILE;
 }
 
-void test_tree_determinism(void) {
-    // Same entries in different order must produce identical serialization
-    Tree tree_a, tree_b;
-    tree_a.count = 2;
-    tree_b.count = 2;
+// Parse binary tree data into a Tree struct safely.
+// Returns 0 on success, -1 on parse error.
+int tree_parse(const void *data, size_t len, Tree *tree_out) {
+    tree_out->count = 0;
+    const uint8_t *ptr = (const uint8_t *)data;
+    const uint8_t *end = ptr + len;
 
-    // tree_a: entries in order z, a
-    tree_a.entries[0].mode = 0100644;
-    memset(tree_a.entries[0].hash.hash, 0x11, HASH_SIZE);
-    strcpy(tree_a.entries[0].name, "z_file.txt");
-    tree_a.entries[1].mode = 0100644;
-    memset(tree_a.entries[1].hash.hash, 0x22, HASH_SIZE);
-    strcpy(tree_a.entries[1].name, "a_file.txt");
+    while (ptr < end && tree_out->count < MAX_TREE_ENTRIES) {
+        TreeEntry *entry = &tree_out->entries[tree_out->count];
 
-    // tree_b: entries in order a, z
-    tree_b.entries[0].mode = 0100644;
-    memset(tree_b.entries[0].hash.hash, 0x22, HASH_SIZE);
-    strcpy(tree_b.entries[0].name, "a_file.txt");
-    tree_b.entries[1].mode = 0100644;
-    memset(tree_b.entries[1].hash.hash, 0x11, HASH_SIZE);
-    strcpy(tree_b.entries[1].name, "z_file.txt");
+        // 1. Safely find the space character for the mode
+        const uint8_t *space = memchr(ptr, ' ', end - ptr);
+        if (!space) return -1; // Malformed data
 
-    void *data_a, *data_b;
-    size_t len_a, len_b;
-    tree_serialize(&tree_a, &data_a, &len_a);
-    tree_serialize(&tree_b, &data_b, &len_b);
+        // Parse mode into an isolated buffer
+        char mode_str[16] = {0};
+        size_t mode_len = space - ptr;
+        if (mode_len >= sizeof(mode_str)) return -1;
+        memcpy(mode_str, ptr, mode_len);
+        entry->mode = strtol(mode_str, NULL, 8);
 
-    assert(len_a == len_b);
-    assert(memcmp(data_a, data_b, len_a) == 0);
+        ptr = space + 1; // Skip space
 
-    free(data_a);
-    free(data_b);
+        // 2. Safely find the null terminator for the name
+        const uint8_t *null_byte = memchr(ptr, '\0', end - ptr);
+        if (!null_byte) return -1; // Malformed data
 
-    printf("PASS: tree deterministic serialization\n");
-}
+        size_t name_len = null_byte - ptr;
+        if (name_len >= sizeof(entry->name)) return -1;
+        memcpy(entry->name, ptr, name_len);
+        entry->name[name_len] = '\0'; // Ensure null-terminated
 
-int main(void) {
-    int rc __attribute__((unused));
-    rc = system("rm -rf .pes");
-    rc = system("mkdir -p .pes/objects .pes/refs/heads");
+        ptr = null_byte + 1; // Skip null byte
 
-    test_tree_roundtrip();
-    test_tree_determinism();
+        // 3. Read the 32-byte binary hash
+        if (ptr + HASH_SIZE > end) return -1; 
+        memcpy(entry->hash.hash, ptr, HASH_SIZE);
+        ptr += HASH_SIZE;
 
-    printf("\nAll Phase 2 tests passed.\n");
+        tree_out->count++;
+    }
     return 0;
+}
+
+// Helper for qsort to ensure consistent tree hashing
+static int compare_tree_entries(const void *a, const void *b) {
+    return strcmp(((const TreeEntry *)a)->name, ((const TreeEntry *)b)->name);
+}
+
+// Serialize a Tree struct into binary format for storage.
+// Caller must free(*data_out).
+// Returns 0 on success, -1 on error.
+int tree_serialize(const Tree *tree, void **data_out, size_t *len_out) {
+    // Estimate max size: (6 bytes mode + 1 byte space + 256 bytes name + 1 byte null + 32 bytes hash) per entry
+    size_t max_size = tree->count * 296; 
+    uint8_t *buffer = malloc(max_size);
+    if (!buffer) return -1;
+
+    // Create a mutable copy to sort entries (Git requirement)
+    Tree sorted_tree = *tree;
+    qsort(sorted_tree.entries, sorted_tree.count, sizeof(TreeEntry), compare_tree_entries);
+
+    size_t offset = 0;
+    for (int i = 0; i < sorted_tree.count; i++) {
+        const TreeEntry *entry = &sorted_tree.entries[i];
+        
+        // Write mode and name (%o writes octal correctly for Git standards)
+        int written = sprintf((char *)buffer + offset, "%o %s", entry->mode, entry->name);
+        offset += written + 1; // +1 to step over the null terminator written by sprintf
+        
+        // Write binary hash
+        memcpy(buffer + offset, entry->hash.hash, HASH_SIZE);
+        offset += HASH_SIZE;
+    }
+
+    *data_out = buffer;
+    *len_out = offset;
+    return 0;
+}
+
+// ─── TODO: Implement these ──────────────────────────────────────────────────
+
+// Build a tree hierarchy from the current index and write all tree
+// objects to the object store.
+//
+// HINTS - Useful functions and concepts for this phase:
+//   - index_load      : load the staged files into memory
+//   - strchr          : find the first '/' in a path to separate directories from files
+//   - strncmp         : compare prefixes to group files belonging to the same subdirectory
+//   - Recursion       : you will likely want to create a recursive helper function 
+//                       (e.g., `write_tree_level(entries, count, depth)`) to handle nested dirs.
+//   - tree_serialize  : convert your populated Tree struct into a binary buffer
+//   - object_write    : save that binary buffer to the store as OBJ_TREE
+//
+// Returns 0 on success, -1 on error.
+int tree_from_index(ObjectID *id_out) {
+    // TODO: Implement recursive tree building
+    // (See Lab Appendix for logical steps)
+    (void)id_out;
+    return -1;
 }
